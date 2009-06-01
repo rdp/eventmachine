@@ -62,31 +62,30 @@ struct em_event {
 /****************
 t_event_callback
 ****************/
-
+VALUE at_conns;
 static void event_callback (struct em_event* e)
 {
 	const char *a1 = e->a1;
 	int a2 = e->a2;
 	const char *a3 = e->a3;
 	int a4 = e->a4;
+	if(at_conns == Qnil)
+          at_conns =  rb_ivar_get (EmModule, Intern_at_conns);
 
 	if (a2 == EM_CONNECTION_READ) {
-		VALUE t = rb_ivar_get (EmModule, Intern_at_conns);
-		VALUE q = rb_hash_aref (t, rb_str_new2(a1));
+		VALUE q = rb_hash_aref (at_conns, rb_str_new2(a1));
 		if (q == Qnil)
 			rb_raise (EM_eConnectionNotBound, "received %d bytes of data for unknown signature: %s", a4, a1);
 		rb_funcall (q, Intern_receive_data, 1, rb_str_new (a3, a4));
 	}
 	else if (a2 == EM_CONNECTION_NOTIFY_READABLE) {
-		VALUE t = rb_ivar_get (EmModule, Intern_at_conns);
-		VALUE q = rb_hash_aref (t, rb_str_new2(a1));
+		VALUE q = rb_hash_aref (at_conns, rb_str_new2(a1));
 		if (q == Qnil)
 			rb_raise (EM_eConnectionNotBound, "unknown connection: %s", a1);
 		rb_funcall (q, Intern_notify_readable, 0);
 	}
 	else if (a2 == EM_CONNECTION_NOTIFY_WRITABLE) {
-		VALUE t = rb_ivar_get (EmModule, Intern_at_conns);
-		VALUE q = rb_hash_aref (t, rb_str_new2(a1));
+		VALUE q = rb_hash_aref (at_conns, rb_str_new2(a1));
 		if (q == Qnil)
 			rb_raise (EM_eConnectionNotBound, "unknown connection: %s", a1);
 		rb_funcall (q, Intern_notify_writable, 0);
@@ -107,15 +106,13 @@ static void event_callback (struct em_event* e)
 	}
 	#ifdef WITH_SSL
 	else if (a2 == EM_SSL_HANDSHAKE_COMPLETED) {
-		VALUE t = rb_ivar_get (EmModule, Intern_at_conns);
-		VALUE q = rb_hash_aref (t, rb_str_new2(a1));
+		VALUE q = rb_hash_aref (at_conns, rb_str_new2(a1));
 		if (q == Qnil)
 			rb_raise (EM_eConnectionNotBound, "unknown connection: %s", a1);
 		rb_funcall (q, Intern_ssl_handshake_completed, 0);
 	}
 	else if (a2 == EM_SSL_VERIFY) {
-		VALUE t = rb_ivar_get (EmModule, Intern_at_conns);
-		VALUE q = rb_hash_aref (t, rb_str_new2(a1));
+		VALUE q = rb_hash_aref (at_conns, rb_str_new2(a1));
 		if (q == Qnil)
 			rb_raise (EM_eConnectionNotBound, "unknown connection: %s", a1);
 		VALUE r = rb_funcall (q, Intern_ssl_verify_peer, 1, rb_str_new(a3, a4));
@@ -124,8 +121,7 @@ static void event_callback (struct em_event* e)
 	}
 	#endif
 	else if (a2 == EM_PROXY_TARGET_UNBOUND) {
-		VALUE t = rb_ivar_get (EmModule, Intern_at_conns);
-		VALUE q = rb_hash_aref (t, rb_str_new2(a1));
+		VALUE q = rb_hash_aref (at_conns, rb_str_new2(a1));
 		if (q == Qnil)
 			rb_raise (EM_eConnectionNotBound, "unknown connection: %s", a1);
 		rb_funcall (q, Intern_proxy_target_unbound, 0);
@@ -929,6 +925,7 @@ Init_rubyeventmachine
 
 extern "C" void Init_rubyeventmachine()
 {
+        at_conns = Qnil;
 	// Lookup Process::Status for get_subprocess_status
 	VALUE rb_mProcess = rb_const_get(rb_cObject, rb_intern("Process"));
 	rb_cProcStatus = rb_const_get(rb_mProcess, rb_intern("Status"));
@@ -949,7 +946,6 @@ extern "C" void Init_rubyeventmachine()
 	Intern_notify_readable = rb_intern ("notify_readable");
 	Intern_notify_writable = rb_intern ("notify_writable");
 	Intern_proxy_target_unbound = rb_intern ("proxy_target_unbound");
-
 	// INCOMPLETE, we need to define class Connections inside module EventMachine
 	// run_machine and run_machine_without_threads are now identical.
 	// Must deprecate the without_threads variant.
