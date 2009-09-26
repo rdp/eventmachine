@@ -34,12 +34,14 @@ module EventMachine
     #
     def self.new(sig, *args) #:nodoc:
       allocate.instance_eval do
+        # Store signature
+        @signature = sig
+        associate_callback_target sig
+
         # Call a superclass's #initialize if it has one
         initialize(*args)
 
-        # Store signature and run #post_init
-        @signature = sig
-        associate_callback_target sig
+        # post initialize callback
         post_init
 
         self
@@ -171,6 +173,10 @@ module EventMachine
     # The connection's socket remains open and its file descriptor number is returned
     def detach
       EventMachine::detach_fd @signature
+    end
+
+    def get_sock_opt level, option
+      EventMachine::get_sock_opt @signature, level, option
     end
 
     # EventMachine::Connection#close_connection_after_writing is a variant of close_connection.
@@ -451,7 +457,7 @@ module EventMachine
 
     # Alias for #set_comm_inactivity_timeout.
     def comm_inactivity_timeout= value
-      self.send :set_comm_inactivity_timeout, value
+      self.set_comm_inactivity_timeout value
     end
 
     # comm_inactivity_timeout= allows you to set the inactivity-timeout property for
@@ -464,10 +470,26 @@ module EventMachine
       EventMachine::set_comm_inactivity_timeout @signature, value.to_f
     end
 
+    # pending_connect_timeout is the duration after which a TCP connection in the connecting 
+    # state will fail. It is important to distinguish this value from comm_inactivity_timeout,
+    # which looks at how long since data was passed on an already established connection.
+    # The value is a float in seconds.
+    def pending_connect_timeout
+      EventMachine::get_pending_connect_timeout @signature
+    end
+
+    # Alias for #set_pending_connect_timeout.
+    def pending_connect_timeout= value
+      self.set_pending_connect_timeout value
+    end
+
+    # set_pending_connect_timeout sets the duration after which a TCP connection in a
+    # connecting state will fail. Takes a float in seconds.
+    def set_pending_connect_timeout value
+      EventMachine::set_pending_connect_timeout @signature, value.to_f
+    end
+
     # Reconnect to a given host/port with the current EventMachine::Connection instance
-    #--
-    # EXPERIMENTAL. DO NOT RELY ON THIS METHOD TO REMAIN SUPPORTED.
-    # (03Nov06)
     def reconnect server, port
       EventMachine::reconnect server, port, self
     end
@@ -500,6 +522,43 @@ module EventMachine
     #
     def stream_file_data filename, args={}
       EventMachine::FileStreamer.new( self, filename, args )
+    end
+
+    # Enable notify_readable callbacks on this connection. Only possible if the connection was created
+    # using EM.attach and had notify_readable/notify_writable defined on the handler.
+    def notify_readable= mode
+      EventMachine::set_notify_readable @signature, mode
+    end
+
+    # Returns true if the connection is being watched for readability.
+    def notify_readable?
+      EventMachine::is_notify_readable @signature
+    end
+
+    # Enable notify_writable callbacks on this connection. Only possible if the connection was created
+    # using EM.attach and had notify_readable/notify_writable defined on the handler.
+    def notify_writable= mode
+      EventMachine::set_notify_writable @signature, mode
+    end
+
+    # Returns true if the connection is being watched for writability.
+    def notify_writable?
+      EventMachine::is_notify_writable @signature
+    end
+
+    # Pause a connection so that #send_data and #receive_data events are not fired until #resume is called.
+    def pause
+      EventMachine::pause_connection @signature
+    end
+
+    # Resume a connection's #send_data and #receive_data events.
+    def resume
+      EventMachine::resume_connection @signature
+    end
+
+    # True if the connect was paused using #pause.
+    def paused?
+      EventMachine::connection_paused? @signature
     end
   end
 end

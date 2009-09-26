@@ -29,6 +29,28 @@
 
 require 'java'
 require 'em_reactor'
+require 'socket'
+
+java_import java.io.FileDescriptor
+java_import java.nio.channels.SocketChannel
+java_import java.lang.reflect.Field
+
+module JavaFields
+  def set_field(key, value)
+    field = getClass.getDeclaredField(key)
+    field.setAccessible(true)
+    field.set(self, value)
+  end
+
+  def get_field(key)
+    field = getClass.getDeclaredField(key)
+    field.setAccessible(true)
+    field.get(self)
+  end
+end
+
+FileDescriptor.send :include, JavaFields
+SocketChannel.send :include, JavaFields
 
 module EventMachine
   # TODO: These event numbers are defined in way too many places.
@@ -39,20 +61,22 @@ module EventMachine
   ConnectionAccepted = 103
   ConnectionCompleted = 104
   LoopbreakSignalled = 105
+  ConnectionNotifyReadable = 106
+  ConnectionNotifyWritable = 107
 
   # This thunk class used to be called EM, but that caused conflicts with
   # the alias "EM" for module EventMachine. (FC, 20Jun08)
   class JEM < com.rubyeventmachine.EmReactor
-    def eventCallback a1, a2, a3
-      s = String.from_java_bytes(a3.array[a3.position...a3.limit])
-      EventMachine::event_callback a1, a2, s
+    def eventCallback a1, a2, a3, a4
+      s = String.from_java_bytes(a3.array[a3.position...a3.limit]) if a3
+      EventMachine::event_callback a1, a2, s || a4
     end
   end
-  class Connection < com.rubyeventmachine.Connection
-    def associate_callback_target sig
-      # No-op for the time being.
-    end
-  end
+  # class Connection < com.rubyeventmachine.Connection
+  #   def associate_callback_target sig
+  #     # No-op for the time being.
+  #   end
+  # end
   def self.initialize_event_machine
     @em = JEM.new
   end
@@ -112,6 +136,18 @@ module EventMachine
     # Epoll is a no-op for Java.
     # The latest Java versions run epoll when possible in NIO.
   end
+  def self.epoll= val
+  end
+  def self.kqueue
+  end
+  def self.kqueue= val
+  end
+  def self.epoll?
+    false
+  end
+  def self.kqueue?
+    false
+  end
   def self.set_rlimit_nofile n_descriptors
     # Currently a no-op for Java.
   end
@@ -128,9 +164,77 @@ module EventMachine
   end
   def self.set_max_timer_count num
     # harmless no-op in Java. There's no built-in timer limit.
+    @max_timer_count = num
+  end
+  def self.get_max_timer_count
+    # harmless no-op in Java. There's no built-in timer limit.
+    @max_timer_count || 100_000
   end
   def self.library_type
     :java
+  end
+  def self.get_peername sig
+    if peer = @em.getPeerName(sig)
+      Socket.pack_sockaddr_in *peer
+    end
+  end
+  def self.attach_fd fileno, watch_mode
+    # 3Aug09: We could pass in the actual SocketChannel, but then it would be modified (set as non-blocking), and
+    # we would need some logic to make sure detach_fd below didn't clobber it. For now, we just always make a new
+    # SocketChannel for the underlying file descriptor
+    # if fileno.java_kind_of? SocketChannel
+    #   ch = fileno
+    #   ch.configureBlocking(false)
+    #   fileno = nil
+    # elsif fileno.java_kind_of? java.nio.channels.Channel
+
+    if fileno.java_kind_of? java.nio.channels.Channel
+      field = fileno.getClass.getDeclaredField('fdVal')
+      field.setAccessible(true)
+      fileno = field.get(fileno)
+    else
+      raise ArgumentError, 'attach_fd requires Java Channel or POSIX fileno' unless fileno.is_a? Fixnum
+    end
+
+    if fileno == 0
+      raise "can't open STDIN as selectable in Java =("
+    elsif fileno.is_a? Fixnum
+      # 8Aug09: The following code is specific to the sun jvm's SocketChannelImpl. Is there a cross-platform
+      # way of implementing this? If so, also remember to update EventableSocketChannel#close and #cleanup
+      fd = FileDescriptor.new
+      fd.set_field 'fd', fileno
+
+      ch = SocketChannel.open
+      ch.configureBlocking(false)
+      ch.kill
+      ch.set_field 'fd', fd
+      ch.set_field 'fdVal', fileno
+      ch.set_field 'state', ch.get_field('ST_CONNECTED')
+    end
+
+    @em.attachChannel(ch,watch_mode)
+  end
+  def self.detach_fd sig
+    if ch = @em.detachChannel(sig)
+      ch.get_field 'fdVal'
+    end
+  end
+
+  def self.set_notify_readable sig, mode
+    @em.setNotifyReadable(sig, mode)
+  end
+  def self.set_notify_writable sig, mode
+    @em.setNotifyWritable(sig, mode)
+  end
+
+  def self.is_notify_readable sig
+    @em.isNotifyReadable(sig)
+  end
+  def self.is_notify_writable sig
+    @em.isNotifyWritable(sig)
+  end
+  def self.get_connection_count
+    @em.getConnectionCount
   end
 
   class Connection

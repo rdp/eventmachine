@@ -90,6 +90,7 @@ require 'em/file_watch'
 require 'em/process_watch'
 
 require 'shellwords'
+require 'thread'
 
 # == Introduction
 # EventMachine provides a fast, lightweight framework for implementing
@@ -180,6 +181,14 @@ require 'shellwords'
 # Interesting thought.
 #
 module EventMachine
+  class <<self
+    # Exposed to allow joining on the thread, when run in a multithreaded
+    # environment. Performing other actions on the thread has undefined
+    # semantics.
+    attr_reader :reactor_thread
+  end
+  @next_tick_mutex = Mutex.new
+
   # EventMachine::run initializes and runs an event loop.
   # This method only returns if user-callback code calls stop_event_loop.
   # Use the supplied block to define your clients and servers.
@@ -241,24 +250,29 @@ module EventMachine
         @reactor_thread = Thread.current
         run_machine
       ensure
+        until @tails.empty?
+          @tails.pop.call
+        end
+
         begin
           release_machine
         ensure
           if @threadpool
             @threadpool.each { |t| t.exit }
-            @threadpool.each { |t| t.kill! if t.alive? }
+            @threadpool.each do |t|
+              next unless t.alive?
+              # ruby 1.9 has no kill!
+              t.respond_to?(:kill!) ? t.kill! : t.kill
+            end
             @threadqueue = nil
             @resultqueue = nil
+            @threadpool = nil
           end
-          @threadpool = nil
+
           @next_tick_queue = nil
         end
         @reactor_running = false
         @reactor_thread = nil
-      end
-
-      until @tails.empty?
-        @tails.pop.call
       end
 
       raise @wrapped_exception if @wrapped_exception
@@ -547,11 +561,13 @@ module EventMachine
       port = nil
     end if port
 
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection > handler
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection >= handler
       handler
+    elsif handler
+      Class.new(Connection){ include handler }
     else
-      Class.new( Connection ) {handler and include handler}
+      Connection
     end
 
     arity = klass.instance_method(:initialize).arity
@@ -613,11 +629,13 @@ module EventMachine
   #    def post_init
   #      send_data "GET / HTTP/1.1\r\nHost: _\r\n\r\n"
   #      @data = ""
+  #      @parsed = false
   #    end
   #  
   #    def receive_data data
   #      @data << data
-  #      if  @data =~ /[\n][\r]*[\n]/m
+  #      if !@parsed and @data =~ /[\n][\r]*[\n]/m
+  #        @parsed = true
   #        puts "RECEIVED HTTP HEADER:"
   #        $`.each {|line| puts ">>> #{line}" }
   #  
@@ -678,6 +696,12 @@ module EventMachine
   # to have them behave differently with respect to post_init
   # if at all possible.
   #
+  def self.connect server, port=nil, handler=nil, *args, &blk
+    bind_connect nil, nil, server, port, handler, *args, &blk
+  end
+
+  # EventMachine::bind_connect is like EventMachine::connect, but allows for a local address/port
+  # to bind the connection to.
   def self.bind_connect bind_addr, bind_port, server, port=nil, handler=nil, *args
     begin
       port = Integer(port)
@@ -689,11 +713,13 @@ module EventMachine
       port = nil
     end if port
 
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection > handler
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection >= handler
       handler
+    elsif handler
+      Class.new(Connection){ include handler }
     else
-      Class.new( Connection ) {handler and include handler}
+      Connection
     end
 
     arity = klass.instance_method(:initialize).arity
@@ -704,7 +730,7 @@ module EventMachine
 
     s = if port
           if bind_addr
-            bind_connect_server bind_addr, bind_port, server, port
+            bind_connect_server bind_addr, bind_port.to_i, server, port
           else
             connect_server server, port
           end
@@ -718,30 +744,25 @@ module EventMachine
     c
   end
 
-  def self.connect server, port=nil, handler=nil, *args, &blk
-    bind_connect nil, nil, server, port, handler, *args, &blk
-  end
-
-  # EventMachine::attach registers a given file descriptor or IO object with the eventloop
+  # EventMachine::watch registers a given file descriptor or IO object with the eventloop. The
+  # file descriptor will not be modified (it will remain blocking or non-blocking).
   #
-  # If the handler provided has the functions notify_readable or notify_writable defined,
-  # EventMachine will not read or write from the socket, and instead fire the corresponding
-  # callback on the handler.
+  # The eventloop can be used to process readable and writable events on the file descriptor, using
+  # EventMachine::Connection#notify_readable= and EventMachine::Connection#notify_writable=
+  #
+  # EventMachine::Connection#notify_readable? and EventMachine::Connection#notify_writable? can be used
+  # to check what events are enabled on the connection.
   #
   # To detach the file descriptor, use EventMachine::Connection#detach
   #
   # === Usage Example
   #
   #  module SimpleHttpClient
-  #    def initialize sock
-  #      @sock = sock
-  #    end
-  #
   #    def notify_readable
-  #      header = @sock.readline
+  #      header = @io.readline
   #
   #      if header == "\r\n"
-  #        # detach returns the file descriptor number (fd == @sock.fileno)
+  #        # detach returns the file descriptor number (fd == @io.fileno)
   #        fd = detach
   #      end
   #    rescue EOFError
@@ -751,7 +772,7 @@ module EventMachine
   #    def unbind
   #      EM.next_tick do
   #        # socket is detached from the eventloop, but still open
-  #        data = @sock.read
+  #        data = @io.read
   #      end
   #    end
   #  end
@@ -759,17 +780,34 @@ module EventMachine
   #  EM.run{
   #    $sock = TCPSocket.new('site.com', 80)
   #    $sock.write("GET / HTTP/1.0\r\n\r\n")
-  #    EM.attach $sock, SimpleHttpClient, $sock
+  #    conn = EM.watch $sock, SimpleHttpClient
+  #    conn.notify_readable = true
   #  }
   #
   #--
   # Thanks to Riham Aldakkak (eSpace Technologies) for the initial patch
-  def  EventMachine::attach io, handler=nil, *args
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection > handler
+  def EventMachine::watch io, handler=nil, *args, &blk
+    attach_io io, true, handler, *args, &blk
+  end
+
+  # Attaches an IO object or file descriptor to the eventloop as a regular connection.
+  # The file descriptor will be set as non-blocking, and EventMachine will process
+  # receive_data and send_data events on it as it would for any other connection.
+  #
+  # To watch a fd instead, use EventMachine::watch, which will not alter the state of the socket
+  # and fire notify_readable and notify_writable events instead.
+  def EventMachine::attach io, handler=nil, *args, &blk
+    attach_io io, false, handler, *args, &blk
+  end
+
+  def EventMachine::attach_io io, watch_mode, handler=nil, *args # :nodoc:
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection >= handler
       handler
+    elsif handler
+      Class.new(Connection){ include handler }
     else
-      Class.new( Connection ) {handler and include handler}
+      Connection
     end
 
     arity = klass.instance_method(:initialize).arity
@@ -778,12 +816,22 @@ module EventMachine
       raise ArgumentError, "wrong number of arguments for #{klass}#initialize (#{args.size} for #{expected})"
     end
 
-    readmode  = klass.public_instance_methods.any?{|m| m.to_sym == :notify_readable }
-    writemode = klass.public_instance_methods.any?{|m| m.to_sym == :notify_writable }
+    if !watch_mode and klass.public_instance_methods.any?{|m| [:notify_readable, :notify_writable].include? m.to_sym }
+      raise ArgumentError, "notify_readable/writable with EM.attach is not supported. Use EM.watch(io){ |c| c.notify_readable = true }"
+    end
 
-    s = attach_fd io.respond_to?(:fileno) ? io.fileno : io, readmode, writemode
+    if io.respond_to?(:fileno)
+      fd = defined?(JRuby) ? JRuby.runtime.getDescriptorByFileno(io.fileno).getChannel : io.fileno
+    else
+      fd = io
+    end
 
+    s = attach_fd fd, watch_mode
     c = klass.new s, *args
+
+    c.instance_variable_set(:@io, io)
+    c.instance_variable_set(:@fd, fd)
+
     @conns[s] = c
     block_given? and yield c
     c
@@ -792,8 +840,6 @@ module EventMachine
 
   # Connect to a given host/port and re-use the provided EventMachine::Connection instance
   #--
-  # EXPERIMENTAL. DO NOT RELY ON THIS METHOD TO BE HERE IN THIS FORM, OR AT ALL.
-  # (03Nov06)
   # Observe, the test for already-connected FAILS if we call a reconnect inside post_init,
   # because we haven't set up the connection in @conns by that point.
   # RESIST THE TEMPTATION to "fix" this problem by redefining the behavior of post_init.
@@ -899,11 +945,13 @@ module EventMachine
   # out that this originally did not take a class but only a module.
   #
   def self.open_datagram_socket address, port, handler=nil, *args
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection > handler
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection >= handler
       handler
+    elsif handler
+      Class.new(Connection){ include handler }
     else
-      Class.new( Connection ) {handler and include handler}
+      Connection
     end
 
     arity = klass.instance_method(:initialize).arity
@@ -1068,7 +1116,7 @@ module EventMachine
   end
 
   def self.spawn_threadpool # :nodoc:
-    until @threadpool.size == @threadpool_size
+    until @threadpool.size == @threadpool_size.to_i
       thread = Thread.new do
         while true
           op, cback = *@threadqueue.pop
@@ -1105,9 +1153,11 @@ module EventMachine
   # extremely expensive even if they're just sleeping.
   #
   def self.next_tick pr=nil, &block
-    raise "no argument or block given" unless ((pr && pr.respond_to?(:call)) or block)
-    (@next_tick_queue ||= []) << ( pr || block )
-    signal_loopbreak if reactor_running?
+    raise ArgumentError, "no proc or block given" unless ((pr && pr.respond_to?(:call)) or block)
+    @next_tick_mutex.synchronize do
+      (@next_tick_queue ||= []) << ( pr || block )
+      signal_loopbreak if reactor_running?
+    end
 =begin
     (@next_tick_procs ||= []) << (pr || block)
     if @next_tick_procs.length == 1
@@ -1181,11 +1231,13 @@ module EventMachine
   # Perhaps misnamed since the underlying function uses socketpair and is full-duplex.
   #
   def self.popen cmd, handler=nil, *args
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection > handler
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection >= handler
       handler
+    elsif handler
+      Class.new(Connection){ include handler }
     else
-      Class.new( Connection ) {handler and include handler}
+      Connection
     end
 
     w = Shellwords::shellwords( cmd )
@@ -1217,11 +1269,13 @@ module EventMachine
   #
   #
   def self.open_keyboard handler=nil, *args
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection > handler
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection >= handler
       handler
+    elsif handler
+      Class.new(Connection){ include handler }
     else
-      Class.new( Connection ) {handler and include handler}
+      Connection
     end
 
     arity = klass.instance_method(:initialize).arity
@@ -1285,6 +1339,8 @@ module EventMachine
   #    end
   #  end
   #
+  #  EM.kqueue = true if EM.kqueue? # file watching requires kqueue on OSX
+  #
   #  EM.run {
   #    EM.watch_file("/tmp/foo", Handler)
   #  }
@@ -1298,11 +1354,13 @@ module EventMachine
   # Calling #path will always return the filename you originally used.
   #
   def self.watch_file(filename, handler=nil, *args)
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::FileWatch' unless FileWatch > handler
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::FileWatch' unless FileWatch >= handler
       handler
+    elsif handler
+      Class.new(FileWatch){ include handler }
     else
-      Class.new( FileWatch ) {handler and include handler}
+      FileWatch
     end
 
     arity = klass.instance_method(:initialize).arity
@@ -1340,11 +1398,13 @@ module EventMachine
   def self.watch_process(pid, handler=nil, *args)
     pid = pid.to_i
 
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::ProcessWatch' unless ProcessWatch > handler
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::ProcessWatch' unless ProcessWatch >= handler
       handler
+    elsif handler
+      Class.new(ProcessWatch){ include handler }
     else
-      Class.new( ProcessWatch ) {handler and include handler}
+      ProcessWatch
     end
 
     arity = klass.instance_method(:initialize).arity
@@ -1494,7 +1554,8 @@ module EventMachine
       c = @conns[conn_binding] or raise ConnectionNotBound, "received ConnectionCompleted for unknown signature: #{conn_binding}"
       c.connection_completed
     ##
-    # The remaining code is a fallback for the pure ruby reactor. Usually these events are handled in the C event_callback() in rubymain.cpp
+    # The remaining code is a fallback for the pure ruby and java reactors.
+    # In the C++ reactor, these events are handled in the C event_callback() in rubymain.cpp
     elsif opcode == TimerFired
       t = @timers.delete( data )
       return if t == false # timer cancelled
@@ -1615,11 +1676,13 @@ module EventMachine
   # This is a provisional implementation of a stream-oriented file access object.
   # We also experiment with wrapping up some better exception reporting.
   def self._open_file_for_writing filename, handler=nil # :nodoc:
-    klass = if (handler and handler.is_a?(Class))
-      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection > handler
+    klass = if handler and handler.is_a?(Class)
+      raise ArgumentError, 'must provide module or subclass of EventMachine::Connection' unless Connection >= handler
       handler
+    elsif handler
+      Class.new(Connection){ include handler }
     else
-      Class.new( Connection ) {handler and include handler}
+      Connection
     end
 
     s = _write_file filename

@@ -56,11 +56,13 @@ class EventableDescriptor: public Bindable_t
 		bool ShouldDelete();
 		// Do we have any data to write? This is used by ShouldDelete.
 		virtual int GetOutboundDataSize() {return 0;}
+		virtual bool IsWatchOnly(){ return false; }
 
-		void ScheduleClose (bool after_writing);
+		virtual void ScheduleClose (bool after_writing);
 		bool IsCloseScheduled();
+		virtual void HandleError(){ ScheduleClose (false); }
 
-		void SetEventCallback (void (*cb)(const char*, int, const char*, int));
+		void SetEventCallback (void (*cb)(const unsigned long, int, const char*, const unsigned long));
 
 		virtual bool GetPeername (struct sockaddr*) {return false;}
 		virtual bool GetSockname (struct sockaddr*) {return false;}
@@ -75,12 +77,14 @@ class EventableDescriptor: public Bindable_t
 
 		virtual float GetCommInactivityTimeout() {return 0.0;}
 		virtual int SetCommInactivityTimeout (float value) {return 0;}
+		float GetPendingConnectTimeout();
+		int SetPendingConnectTimeout (float value);
 
 		#ifdef HAVE_EPOLL
 		struct epoll_event *GetEpollEvent() { return &EpollEvent; }
 		#endif
 
-		virtual void StartProxy(const char*);
+		virtual void StartProxy(const unsigned long);
 		virtual void StopProxy();
 
 	private:
@@ -89,31 +93,21 @@ class EventableDescriptor: public Bindable_t
 
 	protected:
 		int MySocket;
-		enum {
-			// 4 seconds is too short, most other libraries default to OS settings
-			// which in 2.6 kernel defaults to a 60 second connect timeout. 
-			// 
-			// Curl-Multi: http://curl.haxx.se/mail/lib-2001-01/0019.html
-			//
-			// updating to 50 seconds, so we catch it before the OS does
 
-			// can easily be made an instance variable
-			PendingConnectTimeout = 50000000 // now in usec
-		};
-
-		void (*EventCallback)(const char*, int, const char*, int);
+		void (*EventCallback)(const unsigned long, int, const char*, const unsigned long);
 		void _GenericInboundDispatch(const char*, int);
 
 		Int64 CreatedAt;
 		bool bCallbackUnbind;
 		int UnbindReasonCode;
-		char *ProxyTarget;
+		unsigned long ProxyTarget;
 
 		#ifdef HAVE_EPOLL
 		struct epoll_event EpollEvent;
 		#endif
 
 		EventMachine_t *MyEventMachine;
+		int PendingConnectTimeout;
 };
 
 
@@ -147,16 +141,27 @@ class ConnectionDescriptor: public EventableDescriptor
 		ConnectionDescriptor (int, EventMachine_t*);
 		virtual ~ConnectionDescriptor();
 
-		static int SendDataToConnection (const char*, const char*, int);
-		static void CloseConnection (const char*, bool);
-		static int ReportErrorStatus (const char*);
+		static int SendDataToConnection (const unsigned long, const char*, int);
+		static void CloseConnection (const unsigned long, bool);
+		static int ReportErrorStatus (const unsigned long);
 
 		int SendOutboundData (const char*, int);
 
 		void SetConnectPending (bool f);
+		virtual void ScheduleClose (bool after_writing);
+		virtual void HandleError();
 
 		void SetNotifyReadable (bool);
 		void SetNotifyWritable (bool);
+		void SetWatchOnly (bool);
+
+		bool IsPaused(){ return bPaused; }
+		bool Pause();
+		bool Resume();
+
+		bool IsNotifyReadable(){ return bNotifyReadable; }
+		bool IsNotifyWritable(){ return bNotifyWritable; }
+		virtual bool IsWatchOnly(){ return bWatchOnly; }
 
 		virtual void Read();
 		virtual void Write();
@@ -196,10 +201,12 @@ class ConnectionDescriptor: public EventableDescriptor
 		};
 
 	protected:
+		bool bPaused;
 		bool bConnectPending;
 
 		bool bNotifyReadable;
 		bool bNotifyWritable;
+		bool bWatchOnly;
 
 		bool bReadAttemptedAfterClose;
 		bool bWriteAttemptedAfterClose;
@@ -215,16 +222,18 @@ class ConnectionDescriptor: public EventableDescriptor
 		bool bSslVerifyPeer;
 		bool bSslPeerAccepted;
 		#endif
-		bool bIsServer;
 
 		#ifdef HAVE_KQUEUE
 		bool bGotExtraKqueueEvent;
 		#endif
 
+		bool bIsServer;
 		Int64 LastIo;
 		int InactivityTimeout;
 
 	private:
+		void _UpdateEvents();
+		void _UpdateEvents(bool, bool);
 		void _WriteOutboundData();
 		void _DispatchInboundData (const char *buffer, int size);
 		void _DispatchCiphertext();
@@ -264,7 +273,7 @@ class DatagramDescriptor: public EventableDescriptor
     virtual float GetCommInactivityTimeout();
     virtual int SetCommInactivityTimeout (float value);
 
-		static int SendDatagram (const char*, const char*, int, const char*, int);
+		static int SendDatagram (const unsigned long, const char*, int, const char*, int);
 
 
 	protected:
@@ -306,7 +315,7 @@ class AcceptorDescriptor: public EventableDescriptor
 
 		virtual bool GetSockname (struct sockaddr*);
 
-		static void StopAcceptor (const char *binding);
+		static void StopAcceptor (const unsigned long binding);
 };
 
 /********************

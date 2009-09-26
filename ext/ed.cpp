@@ -33,8 +33,15 @@ bool SetSocketNonblocking (SOCKET sd)
 	#endif
 	
 	#ifdef OS_WIN32
+	#ifdef BUILD_FOR_RUBY
+	// 14Jun09 Ruby provides its own wrappers for ioctlsocket. On 1.8 this is a simple wrapper,
+	// however, 1.9 keeps its own state about the socket.
+	// NOTE: F_GETFL is not supported
+	return (fcntl (sd, F_SETFL, O_NONBLOCK) == 0) ? true : false;
+	#else
 	unsigned long one = 1;
 	return (ioctlsocket (sd, FIONBIO, &one) == 0) ? true : false;
+	#endif
 	#endif
 }
 
@@ -51,7 +58,8 @@ EventableDescriptor::EventableDescriptor (int sd, EventMachine_t *em):
 	bCallbackUnbind (true),
 	UnbindReasonCode (0),
 	ProxyTarget(NULL),
-	MyEventMachine (em)
+	MyEventMachine (em),
+	PendingConnectTimeout(20000000)
 {
 	/* There are three ways to close a socket, all of which should
 	 * automatically signal to the event machine that this object
@@ -81,6 +89,7 @@ EventableDescriptor::EventableDescriptor (int sd, EventMachine_t *em):
 	CreatedAt = gCurrentLoopTime;
 
 	#ifdef HAVE_EPOLL
+	EpollEvent.events = 0;
 	EpollEvent.data.ptr = this;
 	#endif
 }
@@ -93,7 +102,7 @@ EventableDescriptor::~EventableDescriptor
 EventableDescriptor::~EventableDescriptor()
 {
 	if (EventCallback && bCallbackUnbind)
-		(*EventCallback)(GetBinding().c_str(), EM_CONNECTION_UNBOUND, NULL, UnbindReasonCode);
+		(*EventCallback)(GetBinding(), EM_CONNECTION_UNBOUND, NULL, UnbindReasonCode);
 	StopProxy();
 	Close();
 }
@@ -103,7 +112,7 @@ EventableDescriptor::~EventableDescriptor()
 EventableDescriptor::SetEventCallback
 *************************************/
 
-void EventableDescriptor::SetEventCallback (void(*cb)(const char*, int, const char*, int))
+void EventableDescriptor::SetEventCallback (void(*cb)(const unsigned long, int, const char*, const unsigned long))
 {
 	EventCallback = cb;
 }
@@ -172,12 +181,12 @@ bool EventableDescriptor::IsCloseScheduled()
 EventableDescriptor::StartProxy
 *******************************/
 
-void EventableDescriptor::StartProxy(const char *to)
+void EventableDescriptor::StartProxy(unsigned long to)
 {
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (to));
 	if (ed) {
 		StopProxy();
-		ProxyTarget = strdup(to);
+		ProxyTarget = to;
 		return;
 	}
 	throw std::runtime_error ("Tried to proxy to an invalid descriptor");
@@ -191,7 +200,6 @@ EventableDescriptor::StopProxy
 void EventableDescriptor::StopProxy()
 {
 	if (ProxyTarget) {
-		free(ProxyTarget);
 		ProxyTarget = NULL;
 	}
 }
@@ -206,11 +214,35 @@ void EventableDescriptor::_GenericInboundDispatch(const char *buf, int size)
 	assert(EventCallback);
 
 	if (!ProxyTarget)
-		(*EventCallback)(GetBinding().c_str(), EM_CONNECTION_READ, buf, size);
+		(*EventCallback)(GetBinding(), EM_CONNECTION_READ, buf, size);
 	else if (ConnectionDescriptor::SendDataToConnection(ProxyTarget, buf, size) == -1) {
-		(*EventCallback)(GetBinding().c_str(), EM_PROXY_TARGET_UNBOUND, NULL, 0);
+		(*EventCallback)(GetBinding(), EM_PROXY_TARGET_UNBOUND, NULL, 0);
 		StopProxy();
 	}
+}
+
+
+/*********************************************
+EventableDescriptor::GetPendingConnectTimeout
+*********************************************/
+
+float EventableDescriptor::GetPendingConnectTimeout()
+{
+	return ((float)PendingConnectTimeout / 1000000);
+}
+
+
+/*********************************************
+EventableDescriptor::SetPendingConnectTimeout
+*********************************************/
+
+int EventableDescriptor::SetPendingConnectTimeout (float value)
+{
+	if (value > 0) {
+		PendingConnectTimeout = (Int64)(value * 1000000);
+		return 1;
+	}
+	return 0;
 }
 
 
@@ -220,9 +252,11 @@ ConnectionDescriptor::ConnectionDescriptor
 
 ConnectionDescriptor::ConnectionDescriptor (int sd, EventMachine_t *em):
 	EventableDescriptor (sd, em),
+	bPaused (false),
 	bConnectPending (false),
 	bNotifyReadable (false),
 	bNotifyWritable (false),
+	bWatchOnly (false),
 	bReadAttemptedAfterClose (false),
 	bWriteAttemptedAfterClose (false),
 	OutboundDataSize (0),
@@ -265,7 +299,7 @@ ConnectionDescriptor::~ConnectionDescriptor()
 STATIC: ConnectionDescriptor::SendDataToConnection
 **************************************************/
 
-int ConnectionDescriptor::SendDataToConnection (const char *binding, const char *data, int data_length)
+int ConnectionDescriptor::SendDataToConnection (const unsigned long binding, const char *data, int data_length)
 {
 	// TODO: This is something of a hack, or at least it's a static method of the wrong class.
 	// TODO: Poor polymorphism here. We should be calling one virtual method
@@ -289,7 +323,7 @@ int ConnectionDescriptor::SendDataToConnection (const char *binding, const char 
 STATIC: ConnectionDescriptor::CloseConnection
 *********************************************/
 
-void ConnectionDescriptor::CloseConnection (const char *binding, bool after_writing)
+void ConnectionDescriptor::CloseConnection (const unsigned long binding, bool after_writing)
 {
 	// TODO: This is something of a hack, or at least it's a static method of the wrong class.
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (binding));
@@ -301,7 +335,7 @@ void ConnectionDescriptor::CloseConnection (const char *binding, bool after_writ
 STATIC: ConnectionDescriptor::ReportErrorStatus
 ***********************************************/
 
-int ConnectionDescriptor::ReportErrorStatus (const char *binding)
+int ConnectionDescriptor::ReportErrorStatus (const unsigned long binding)
 {
 	// TODO: This is something of a hack, or at least it's a static method of the wrong class.
 	// TODO: Poor polymorphism here. We should be calling one virtual method
@@ -312,6 +346,49 @@ int ConnectionDescriptor::ReportErrorStatus (const char *binding)
 	return -1;
 }
 
+/***********************************
+ConnectionDescriptor::_UpdateEvents
+************************************/
+
+void ConnectionDescriptor::_UpdateEvents()
+{
+	_UpdateEvents(true, true);
+}
+
+void ConnectionDescriptor::_UpdateEvents(bool read, bool write)
+{
+	if (MySocket == INVALID_SOCKET)
+		return;
+
+	#ifdef HAVE_EPOLL
+	unsigned int old = EpollEvent.events;
+
+	if (read) {
+		if (SelectForRead())
+			EpollEvent.events |= EPOLLIN;
+		else
+			EpollEvent.events &= ~EPOLLIN;
+	}
+
+	if (write) {
+		if (SelectForWrite())
+			EpollEvent.events |= EPOLLOUT;
+		else
+			EpollEvent.events &= ~EPOLLOUT;
+	}
+
+	if (old != EpollEvent.events)
+		MyEventMachine->Modify (this);
+	#endif
+
+	#ifdef HAVE_KQUEUE
+	if (read && SelectForRead())
+		MyEventMachine->ArmKqueueReader (this);
+	if (write && SelectForWrite())
+		MyEventMachine->ArmKqueueWriter (this);
+	#endif
+}
+
 /***************************************
 ConnectionDescriptor::SetConnectPending
 ****************************************/
@@ -319,24 +396,53 @@ ConnectionDescriptor::SetConnectPending
 void ConnectionDescriptor::SetConnectPending(bool f)
 {
 	bConnectPending = f;
+	_UpdateEvents();
+}
 
-	if (bConnectPending) { // not yet connected, select for writability
-		#ifdef HAVE_EPOLL
-		EpollEvent.events = EPOLLOUT;
-		#endif
-		#ifdef HAVE_KQUEUE
-		MyEventMachine->ArmKqueueWriter (this);
-		#endif
-	} else { // connected, wait for incoming data and write out any pending outgoing data
-		#ifdef HAVE_EPOLL
-		EpollEvent.events = EPOLLIN | (SelectForWrite() ? EPOLLOUT : 0);
-		#endif
-		#ifdef HAVE_KQUEUE
-		MyEventMachine->ArmKqueueReader (this);
-		if (SelectForWrite())
-			MyEventMachine->ArmKqueueWriter (this);
-		#endif
+
+/**********************************
+ConnectionDescriptor::SetWatchOnly
+***********************************/
+
+void ConnectionDescriptor::SetWatchOnly(bool watching)
+{
+	bWatchOnly = watching;
+	_UpdateEvents();
+}
+
+
+/*********************************
+ConnectionDescriptor::HandleError
+*********************************/
+
+void ConnectionDescriptor::HandleError()
+{
+	if (bWatchOnly) {
+		// An EPOLLHUP | EPOLLIN condition will call Read() before HandleError(), in which case the
+		// socket is already detached and invalid, so we don't need to do anything.
+		if (MySocket == INVALID_SOCKET) return;
+
+		// HandleError() is called on WatchOnly descriptors by the epoll reactor
+		// when it gets a EPOLLERR | EPOLLHUP. Usually this would show up as a readable and
+		// writable event on other reactors, so we have to fire those events ourselves.
+		if (bNotifyReadable) Read();
+		if (bNotifyWritable) Write();
+	} else {
+		ScheduleClose (false);
 	}
+}
+
+
+/***********************************
+ConnectionDescriptor::ScheduleClose
+***********************************/
+
+void ConnectionDescriptor::ScheduleClose (bool after_writing)
+{
+	if (bWatchOnly)
+		throw std::runtime_error ("cannot close 'watch only' connections");
+
+	EventableDescriptor::ScheduleClose(after_writing);
 }
 
 
@@ -346,15 +452,11 @@ ConnectionDescriptor::SetNotifyReadable
 
 void ConnectionDescriptor::SetNotifyReadable(bool readable)
 {
+	if (!bWatchOnly)
+		throw std::runtime_error ("notify_readable must be on 'watch only' connections");
+
 	bNotifyReadable = readable;
-	if (bNotifyReadable) {
-		#ifdef HAVE_EPOLL
-		EpollEvent.events |= EPOLLIN;
-		#endif
-		#ifdef HAVE_KQUEUE
-		MyEventMachine->ArmKqueueReader (this);
-		#endif
-	}
+	_UpdateEvents(true, false);
 }
 
 
@@ -364,15 +466,11 @@ ConnectionDescriptor::SetNotifyWritable
 
 void ConnectionDescriptor::SetNotifyWritable(bool writable)
 {
+	if (!bWatchOnly)
+		throw std::runtime_error ("notify_writable must be on 'watch only' connections");
+
 	bNotifyWritable = writable;
-	if (bNotifyWritable) {
-		#ifdef HAVE_EPOLL
-		EpollEvent.events |= EPOLLOUT;
-		#endif
-		#ifdef HAVE_KQUEUE
-		MyEventMachine->ArmKqueueWriter (this);
-		#endif
-	}
+	_UpdateEvents(false, true);
 }
 
 
@@ -382,6 +480,9 @@ ConnectionDescriptor::SendOutboundData
 
 int ConnectionDescriptor::SendOutboundData (const char *data, int length)
 {
+	if (bWatchOnly)
+		throw std::runtime_error ("cannot send data on a 'watch only' connection");
+
 	#ifdef WITH_SSL
 	if (SslBox) {
 		if (length > 0) {
@@ -434,14 +535,7 @@ int ConnectionDescriptor::_SendRawOutboundData (const char *data, int length)
 	OutboundPages.push_back (OutboundPage (buffer, length));
 	OutboundDataSize += length;
 
-	#ifdef HAVE_EPOLL
-	EpollEvent.events = (EPOLLIN | EPOLLOUT);
-	assert (MyEventMachine);
-	MyEventMachine->Modify (this);
-	#endif
-	#ifdef HAVE_KQUEUE
-	MyEventMachine->ArmKqueueWriter (this);
-	#endif
+	_UpdateEvents(false, true);
 
 	return length;
 }
@@ -468,7 +562,14 @@ bool ConnectionDescriptor::SelectForRead()
    * is known to be in a connected state.
    */
 
-  return bConnectPending ? false : true;
+  if (bPaused)
+    return false;
+  else if (bConnectPending)
+    return false;
+  else if (bWatchOnly)
+    return bNotifyReadable ? true : false;
+  else
+    return true;
 }
 
 
@@ -484,13 +585,43 @@ bool ConnectionDescriptor::SelectForWrite()
    * have outgoing data to send.
    */
 
-  if (bConnectPending || bNotifyWritable)
+  if (bPaused)
+    return false;
+  else if (bConnectPending)
     return true;
-  else {
+  else if (bWatchOnly)
+    return bNotifyWritable ? true : false;
+  else
     return (GetOutboundDataSize() > 0);
-  }
 }
 
+/***************************
+ConnectionDescriptor::Pause
+***************************/
+
+bool ConnectionDescriptor::Pause()
+{
+	if (bWatchOnly)
+		throw std::runtime_error ("cannot pause/resume 'watch only' connections, set notify readable/writable instead");
+
+	bool old = bPaused;
+	bPaused = true;
+	return old == false;
+}
+
+/****************************
+ConnectionDescriptor::Resume
+****************************/
+
+bool ConnectionDescriptor::Resume()
+{
+	if (bWatchOnly)
+		throw std::runtime_error ("cannot pause/resume 'watch only' connections, set notify readable/writable instead");
+
+	bool old = bPaused;
+	bPaused = false;
+	return old == true;
+}
 
 /**************************
 ConnectionDescriptor::Read
@@ -529,9 +660,9 @@ void ConnectionDescriptor::Read()
 		return;
 	}
 
-	if (bNotifyReadable) {
-		if (EventCallback)
-			(*EventCallback)(GetBinding().c_str(), EM_CONNECTION_NOTIFY_READABLE, NULL, 0);
+	if (bWatchOnly) {
+		if (bNotifyReadable && EventCallback)
+			(*EventCallback)(GetBinding(), EM_CONNECTION_NOTIFY_READABLE, NULL, 0);
 		return;
 	}
 
@@ -635,7 +766,7 @@ void ConnectionDescriptor::_CheckHandshakeStatus()
 	if (SslBox && (!bHandshakeSignaled) && SslBox->IsHandshakeCompleted()) {
 		bHandshakeSignaled = true;
 		if (EventCallback)
-			(*EventCallback)(GetBinding().c_str(), EM_SSL_HANDSHAKE_COMPLETED, NULL, 0);
+			(*EventCallback)(GetBinding(), EM_SSL_HANDSHAKE_COMPLETED, NULL, 0);
 	}
 	#endif
 }
@@ -672,7 +803,7 @@ void ConnectionDescriptor::Write()
 		#endif
 		if ((o == 0) && (error == 0)) {
 			if (EventCallback)
-				(*EventCallback)(GetBinding().c_str(), EM_CONNECTION_COMPLETED, "", 0);
+				(*EventCallback)(GetBinding(), EM_CONNECTION_COMPLETED, "", 0);
 
 			// 5May09: Moved epoll/kqueue read/write arming into SetConnectPending, so it can be called
 			// from EventMachine_t::AttachFD as well.
@@ -686,9 +817,13 @@ void ConnectionDescriptor::Write()
 
 		if (bNotifyWritable) {
 			if (EventCallback)
-				(*EventCallback)(GetBinding().c_str(), EM_CONNECTION_NOTIFY_WRITABLE, NULL, 0);
+				(*EventCallback)(GetBinding(), EM_CONNECTION_NOTIFY_WRITABLE, NULL, 0);
+
+			_UpdateEvents(false, true);
 			return;
 		}
+
+		assert(!bWatchOnly);
 
 		/* 5May09: Kqueue bugs on OSX cause one extra writable event to fire even though we're using
 		   EV_ONESHOT. We ignore this extra event once, but only the first time. If it happens again,
@@ -798,7 +933,7 @@ void ConnectionDescriptor::_WriteOutboundData()
 
 	#ifdef HAVE_WRITEV
 	if (!err) {
-		int sent = bytes_written;
+		unsigned int sent = bytes_written;
 		deque<OutboundPage>::iterator op = OutboundPages.begin();
 
 		for (int i = 0; i < iovcnt; i++) {
@@ -831,16 +966,7 @@ void ConnectionDescriptor::_WriteOutboundData()
 	}
 	#endif
 
-	#ifdef HAVE_EPOLL
-	EpollEvent.events = (EPOLLIN | (SelectForWrite() ? EPOLLOUT : 0));
-	assert (MyEventMachine);
-	MyEventMachine->Modify (this);
-	#endif
-	#ifdef HAVE_KQUEUE
-	if (SelectForWrite())
-		MyEventMachine->ArmKqueueWriter (this);
-	#endif
-
+	_UpdateEvents(false, true);
 
 	if (err) {
 		#ifdef OS_UNIX
@@ -886,7 +1012,7 @@ void ConnectionDescriptor::StartTls()
 	if (SslBox)
 		throw std::runtime_error ("SSL/TLS already running on connection");
 
-	SslBox = new SslBox_t (bIsServer, PrivateKeyFilename, CertChainFilename, bSslVerifyPeer, GetBinding().c_str());
+	SslBox = new SslBox_t (bIsServer, PrivateKeyFilename, CertChainFilename, bSslVerifyPeer, GetBinding());
 	_DispatchCiphertext();
 	#endif
 
@@ -942,7 +1068,7 @@ bool ConnectionDescriptor::VerifySslPeer(const char *cert)
 	bSslPeerAccepted = false;
 
 	if (EventCallback)
-		(*EventCallback)(GetBinding().c_str(), EM_SSL_VERIFY, cert, strlen(cert));
+		(*EventCallback)(GetBinding(), EM_SSL_VERIFY, cert, strlen(cert));
 
 	return bSslPeerAccepted;
 }
@@ -1126,7 +1252,7 @@ AcceptorDescriptor::~AcceptorDescriptor()
 STATIC: AcceptorDescriptor::StopAcceptor
 ****************************************/
 
-void AcceptorDescriptor::StopAcceptor (const char *binding)
+void AcceptorDescriptor::StopAcceptor (const unsigned long binding)
 {
 	// TODO: This is something of a hack, or at least it's a static method of the wrong class.
 	AcceptorDescriptor *ad = dynamic_cast <AcceptorDescriptor*> (Bindable_t::GetObject (binding));
@@ -1192,7 +1318,7 @@ void AcceptorDescriptor::Read()
 			throw std::runtime_error ("no newly accepted connection");
 		cd->SetServerMode();
 		if (EventCallback) {
-			(*EventCallback) (GetBinding().c_str(), EM_CONNECTION_ACCEPTED, cd->GetBinding().c_str(), cd->GetBinding().size());
+			(*EventCallback) (GetBinding(), EM_CONNECTION_ACCEPTED, NULL, cd->GetBinding());
 		}
 		#ifdef HAVE_EPOLL
 		cd->GetEpollEvent()->events = EPOLLIN | (cd->SelectForWrite() ? EPOLLOUT : 0);
@@ -1279,7 +1405,7 @@ DatagramDescriptor::DatagramDescriptor (int sd, EventMachine_t *parent_em):
 	 */
 
 	int oval = 1;
-	int sob = setsockopt (GetSocket(), SOL_SOCKET, SO_BROADCAST, (char*)&oval, sizeof(oval));
+	setsockopt (GetSocket(), SOL_SOCKET, SO_BROADCAST, (char*)&oval, sizeof(oval));
 
 	#ifdef HAVE_EPOLL
 	EpollEvent.events = EPOLLIN;
@@ -1437,6 +1563,10 @@ void DatagramDescriptor::Write()
 	assert (MyEventMachine);
 	MyEventMachine->Modify (this);
 	#endif
+	#ifdef HAVE_KQUEUE
+	if (SelectForWrite())
+		MyEventMachine->ArmKqueueWriter (this);
+	#endif
 }
 
 
@@ -1484,6 +1614,9 @@ int DatagramDescriptor::SendOutboundData (const char *data, int length)
 	EpollEvent.events = (EPOLLIN | EPOLLOUT);
 	assert (MyEventMachine);
 	MyEventMachine->Modify (this);
+	#endif
+	#ifdef HAVE_KQUEUE
+	MyEventMachine->ArmKqueueWriter (this);
 	#endif
 
 	return length;
@@ -1540,6 +1673,9 @@ int DatagramDescriptor::SendOutboundDatagram (const char *data, int length, cons
 	assert (MyEventMachine);
 	MyEventMachine->Modify (this);
 	#endif
+	#ifdef HAVE_KQUEUE
+	MyEventMachine->ArmKqueueWriter (this);
+	#endif
 
 	return length;
 }
@@ -1549,7 +1685,7 @@ int DatagramDescriptor::SendOutboundDatagram (const char *data, int length, cons
 STATIC: DatagramDescriptor::SendDatagram
 ****************************************/
 
-int DatagramDescriptor::SendDatagram (const char *binding, const char *data, int length, const char *address, int port)
+int DatagramDescriptor::SendDatagram (const unsigned long binding, const char *data, int length, const char *address, int port)
 {
 	DatagramDescriptor *dd = dynamic_cast <DatagramDescriptor*> (Bindable_t::GetObject (binding));
 	if (dd)

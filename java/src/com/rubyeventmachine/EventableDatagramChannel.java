@@ -50,14 +50,14 @@ public class EventableDatagramChannel implements EventableChannel {
 	}
 	
 	DatagramChannel channel;
-	String binding;
+	long binding;
 	Selector selector;
 	boolean bCloseScheduled;
 	LinkedList<Packet> outboundQ;
 	SocketAddress returnAddress;
 	
 
-	public EventableDatagramChannel (DatagramChannel dc, String _binding, Selector sel) throws ClosedChannelException {
+	public EventableDatagramChannel (DatagramChannel dc, long _binding, Selector sel) throws ClosedChannelException {
 		channel = dc;
 		binding = _binding;
 		selector = sel;
@@ -89,18 +89,23 @@ public class EventableDatagramChannel implements EventableChannel {
 		}
 	}
 	
-	public void scheduleClose (boolean afterWriting) {
+	public boolean scheduleClose (boolean afterWriting) {
 		System.out.println ("NOT SCHEDULING CLOSE ON DATAGRAM");
+		return false;
 	}
 	
 	public void startTls() {
 		throw new RuntimeException ("TLS is unimplemented on this Channel");
 	}
 	
-	public String getBinding() {
+	public long getBinding() {
 		return binding;
 	}
-	
+
+	public void register() throws ClosedChannelException {
+		// TODO
+	}
+
 	/**
 	 * Terminate with extreme prejudice. Don't assume there will be another pass through
 	 * the reactor core.
@@ -168,4 +173,17 @@ public class EventableDatagramChannel implements EventableChannel {
 		// TODO
 		System.out.println ("DATAGRAM: SET COMM INACTIVITY UNIMPLEMENTED " + seconds);
 	}
+
+	public Object[] getPeerName () {
+		if (returnAddress != null) {
+			InetSocketAddress inetAddr = (InetSocketAddress) returnAddress;
+			return new Object[]{ inetAddr.getPort(), inetAddr.getHostName() };
+		} else {
+			return null;
+		}
+	}
+
+	public boolean isWatchOnly() { return false; }
+	public boolean isNotifyReadable() { return false; }
+	public boolean isNotifyWritable() { return false; }
 }
