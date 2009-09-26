@@ -747,7 +747,7 @@ extern "C" int evma_send_file_data_to_connection (const unsigned long binding, c
 	if (Fd < 0)
 		return errno;
 	// From here on, all early returns MUST close Fd.
-
+#undef fstat // windows compat
 	struct stat st;
 	if (fstat (Fd, &st)) {
 		int e = errno;

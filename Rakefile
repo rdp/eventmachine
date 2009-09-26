@@ -26,7 +26,7 @@
 # # and then nmake). Then copy rubyeventmachine.so into the lib directory,
 # # and run rake gemwin32.
 #
-
+$: << '.' # 1.9.2 compat.
 require 'rubygems'  unless defined?(Gem)
 require 'rake'      unless defined?(Rake)
 require 'rake/gempackagetask'
